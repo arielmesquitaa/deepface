@@ -82,7 +82,7 @@ def analyze(
     anti_spoofing: bool,
 ) -> Tuple[Dict[str, Any], int]:
     try:
-        result = {}
+        result: Dict[str, Any] = {}
         demographies = DeepFace.analyze(
             img_path=img_path,
             actions=actions,
@@ -92,7 +92,25 @@ def analyze(
             silent=True,
             anti_spoofing=anti_spoofing,
         )
-        result["results"] = demographies
+
+        # DeepFace may return numpy scalar types (e.g., float32) which are not JSON serializable.
+        # Normalize to plain Python types before returning to Flask.
+        import numpy as np
+
+        def _to_jsonable(obj: Any) -> Any:
+            if isinstance(obj, dict):
+                return {k: _to_jsonable(v) for k, v in obj.items()}
+            if isinstance(obj, list):
+                return [_to_jsonable(v) for v in obj]
+            if isinstance(obj, tuple):
+                return [_to_jsonable(v) for v in obj]
+            if isinstance(obj, np.ndarray):
+                return obj.tolist()
+            if isinstance(obj, np.generic):
+                return obj.item()
+            return obj
+
+        result["results"] = _to_jsonable(demographies)
         return result, 200
     except Exception as err:
         tb_str = traceback.format_exc()

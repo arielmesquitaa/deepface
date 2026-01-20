@@ -51,7 +51,7 @@ class Logger:
             message: The message to log.
         """
         if self.log_level <= logging.DEBUG:
-            self.dump_log(f"🕷️ {message}")
+            self.dump_log(f"DEBUG {message}")
 
     def warn(self, message: Any) -> None:
         """
@@ -60,7 +60,7 @@ class Logger:
             message: The message to log.
         """
         if self.log_level <= logging.WARNING:
-            self.dump_log(f"⚠️ {message}")
+            self.dump_log(f"WARN {message}")
 
     def error(self, message: Any) -> None:
         """
@@ -69,7 +69,7 @@ class Logger:
             message: The message to log.
         """
         if self.log_level <= logging.ERROR:
-            self.dump_log(f"🔴 {message}")
+            self.dump_log(f"ERROR {message}")
 
     def critical(self, message: Any) -> None:
         """
@@ -78,7 +78,7 @@ class Logger:
             message: The message to log.
         """
         if self.log_level <= logging.CRITICAL:
-            self.dump_log(f"💥 {message}")
+            self.dump_log(f"CRITICAL {message}")
 
     def dump_log(self, message: Any) -> None:
         """
