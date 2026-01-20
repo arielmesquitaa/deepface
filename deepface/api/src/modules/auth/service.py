@@ -22,7 +22,6 @@ class AuthService:
         return None
 
     def validate(self, headers: Dict[str, Any]) -> bool:
-        return True
         if not self.is_auth_enabled:
             logger.debug("Authentication is disabled. Skipping token validation.")
             return True
