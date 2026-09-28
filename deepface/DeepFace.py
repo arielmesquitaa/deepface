@@ -1,8 +1,7 @@
 # common dependencies
 import os
 import warnings
-import logging
-from typing import Any, Dict, IO, List, Union, Optional, Sequence, Tuple, cast
+from typing import Any, Dict, IO, List, Union, Optional, Sequence, Tuple, cast, Callable
 
 # this has to be set before importing tensorflow
 os.environ["TF_USE_LEGACY_KERAS"] = "1"
@@ -11,13 +10,13 @@ os.environ["TF_USE_LEGACY_KERAS"] = "1"
 
 # 3rd party dependencies
 from numpy.typing import NDArray
+
 import pandas as pd
-import tensorflow as tf
 from lightphe import LightPHE
 from lightdsa import LightDSA
 
 # package dependencies
-from deepface.commons import package_utils, folder_utils
+from deepface.commons import backend_utils, package_utils, folder_utils
 from deepface.commons.logger import Logger
 from deepface.modules import (
     modeling,
@@ -32,19 +31,44 @@ from deepface.modules import (
 )
 from deepface import __version__
 
+
 logger = Logger()
+
+# -----------------------------------
+# warn users about upcoming changes in backend installation.
+
+if "_DEPRECATION_WARNING_SHOWN" not in globals():
+    global _DEPRECATION_WARNING_SHOWN # pylint: disable=global-at-module-level
+    _DEPRECATION_WARNING_SHOWN = True
+    logger.warn(
+        "\n"
+        + "=" * 70 + "\n"
+        " ⚠️ DEPRECATION WARNING:\n"
+        " Running 'pip install deepface' alone will no longer be sufficient and will\n"
+        " NOT install a default backend in an upcoming major release.\n\n"
+        " Currently, TensorFlow is included by default, but this behavior will be deprecated.\n"
+        " Please explicitly specify your preferred backend engine when installing:\n\n"
+        "   -> pip install deepface[tensorflow]\n"
+        "   -> pip install deepface[pytorch]\n\n"
+        " Otherwise, you will encounter 'module not found' errors.\n"
+        + "=" * 70 + "\n"
+    )
 
 # -----------------------------------
 # configurations for dependencies
 
-# users should install tf_keras package if they are using tf 2.16 or later versions
-package_utils.validate_for_keras3()
-
 warnings.filterwarnings("ignore")
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-tf_version = package_utils.get_tf_major_version()
-if tf_version == 2:
-    tf.get_logger().setLevel(logging.ERROR)
+
+# deepface runs either on tensorflow or on pytorch, and it does not import the one it
+# does not run on. see deepface.commons.backend_utils for the way that is decided.
+backend_engine = backend_utils.get_backend_engine()
+logger.debug(f"deepface will run on {backend_engine}")
+
+if backend_engine == backend_utils.TENSORFLOW:
+    # users should install tf_keras package if they are using tf 2.16 or later versions
+    package_utils.validate_for_keras3()
+    package_utils.configure_tensorflow_logging()
 # -----------------------------------
 
 # create required folders if necessary to store model weights
@@ -77,7 +101,7 @@ def verify(
     img2_path: Union[str, NDArray[Any], IO[bytes], List[float]],
     model_name: str = "VGG-Face",
     detector_backend: str = "opencv",
-    distance_metric: str = "cosine",
+    distance_metric: Union[str, Callable] = "cosine", # type: ignore[type-arg]
     enforce_detection: bool = True,
     align: bool = True,
     expand_percentage: int = 0,
@@ -282,7 +306,7 @@ def find(
     img_path: Union[str, NDArray[Any], IO[bytes]],
     db_path: str,
     model_name: str = "VGG-Face",
-    distance_metric: str = "cosine",
+    distance_metric: Union[str, Callable] = "cosine", # type: ignore[type-arg]
     enforce_detection: bool = True,
     detector_backend: str = "opencv",
     align: bool = True,
@@ -307,7 +331,11 @@ def find(
             faces, the result will include information for each detected face.
 
         db_path (string): Path to the folder containing image files. All detected faces
-            in the database will be considered in the decision-making process.
+            in the database will be considered in the decision-making process. Besides a local
+            folder, it can be an S3 location (s3://bucket/prefix) or an FTP location
+            (ftp://user:password@host:port/path). The representations pickle is stored
+            in the same location. S3 credentials and endpoint are resolved by boto3, e.g. with
+            AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY and AWS_ENDPOINT_URL environment variables.
 
         model_name (str): Model for face recognition. Options: VGG-Face, Facenet, Facenet512,
             OpenFace, DeepFace, DeepID, Dlib, ArcFace, SFace and GhostFaceNet (default is VGG-Face).
@@ -760,7 +788,7 @@ def register(
             Options: base, raw, Facenet, Facenet2018, VGGFace, VGGFace2, ArcFace (default is base).
         anti_spoofing (boolean): Flag to enable anti spoofing (default is False).
         database_type (str): Type of database to register identities. Options: 'postgres', 'mongo',
-            'weaviate', 'neo4j', 'pgvector', 'pinecone' (default is 'postgres').
+            'weaviate', 'neo4j', 'pgvector', 'pinecone', 'milvus', 'qdrant' (default is 'postgres').
         connection_details (dict or str): Connection details for the database.
         connection (Any): Existing database connection object. If provided, this connection
             will be used instead of creating a new one.
@@ -773,6 +801,12 @@ def register(
             - DEEPFACE_WEAVIATE_URI
             - DEEPFACE_NEO4J_URI
             - DEEPFACE_PINECONE_API_KEY
+            - DEEPFACE_MILVUS_URI
+            - DEEPFACE_QDRANT_URI
+
+        Note:
+            For graph databases (neo4j), age, gender, emotion and race of each face are
+            also predicted and stored as properties of the face.
     Returns:
         result (dict): A dictionary containing registration results with following keys.
             - inserted (int): Number of embeddings successfully registered to the database.
@@ -844,7 +878,7 @@ def search(
         search_method (str): Method to use for searching identities. Options: 'exact', 'ann'.
             To use ann search, you must run build_index function first to create the index.
         database_type (str): Type of database to search identities. Options: 'postgres', 'mongo',
-            'weaviate', 'neo4j', 'pgvector', 'pinecone' (default is 'postgres').
+            'weaviate', 'neo4j', 'pgvector', 'pinecone', 'milvus', 'qdrant' (default is 'postgres').
         connection_details (dict or str): Connection details for the database.
         connection (Any): Existing database connection object. If provided, this connection
             will be used instead of creating a new one.
@@ -857,6 +891,8 @@ def search(
             - DEEPFACE_WEAVIATE_URI
             - DEEPFACE_NEO4J_URI
             - DEEPFACE_PINECONE_API_KEY
+            - DEEPFACE_MILVUS_URI
+            - DEEPFACE_QDRANT_URI
     Returns:
         results (List[pd.DataFrame]):
             A list of pandas dataframes or a list of dicts. Each dataframe or dict corresponds
@@ -902,6 +938,120 @@ def search(
     )
 
 
+def identify(
+    img: Union[str, NDArray[Any], IO[bytes]],
+    identity_id: Union[str, int],
+    model_name: str = "VGG-Face",
+    detector_backend: str = "opencv",
+    distance_metric: str = "cosine",
+    enforce_detection: bool = True,
+    align: bool = True,
+    l2_normalize: bool = False,
+    expand_percentage: int = 0,
+    normalization: str = "base",
+    anti_spoofing: bool = False,
+    database_type: str = "postgres",
+    connection_details: Optional[Union[Dict[str, Any], str]] = None,
+    connection: Any = None,
+) -> Dict[str, Any]:
+    """
+    Verify given image against a single identity registered in the database.
+
+    While search function compares the given image against all identities in the database
+        in O(n), this function pulls the embedding of the given id only and compares the
+        given image against that identity in O(1).
+
+    Args:
+        img (str or np.ndarray or IO[bytes]): The exact path to the image, a numpy array
+            in BGR format, a file object that supports at least `.read` and is opened in binary
+            mode, or a base64 encoded image. This must be a single image, batch of images is
+            not allowed. That single image may still have many faces, then the closest face
+            to the given identity is used.
+        identity_id (str or int): ID of the embedding record in the database to compare
+            the given image against. IDs are returned by the search function.
+        model_name (str): Model for face recognition. Options: VGG-Face, Facenet, Facenet512,
+            OpenFace, DeepFace, DeepID, Dlib, ArcFace, SFace and GhostFaceNet (default is VGG-Face).
+        detector_backend (string): face detector backend. Options: 'opencv', 'retinaface',
+            'mtcnn', 'ssd', 'dlib', 'mediapipe', 'yolov8n', 'yolov8m', 'yolov8l', 'yolov11n',
+            'yolov11s', 'yolov11m', 'yolov11l', 'yolov12n', 'yolov12s', 'yolov12m', 'yolov12l',
+            'centerface' or 'skip' (default is opencv).
+        distance_metric (string): Metric for measuring similarity. Options: 'cosine',
+            'euclidean', 'euclidean_l2', 'angular' (default is cosine).
+        enforce_detection (boolean): If no face is detected in an image, raise an exception.
+            Set to False to avoid the exception for low-resolution images (default is True).
+        align (bool): Flag to enable face alignment (default is True).
+        l2_normalize (bool): Flag to enable L2 normalization (unit vector normalization)
+        expand_percentage (int): expand detected facial area with a percentage (default is 0).
+        normalization (string): Normalize the input image before feeding it to the model.
+            Options: base, raw, Facenet, Facenet2018, VGGFace, VGGFace2, ArcFace (default is base).
+        anti_spoofing (boolean): Flag to enable anti spoofing (default is False).
+        database_type (str): Type of database storing the identities. Options: 'postgres',
+            'mongo', 'weaviate', 'neo4j', 'pgvector', 'pinecone', 'milvus', 'qdrant'
+            (default is 'postgres').
+        connection_details (dict or str): Connection details for the database.
+        connection (Any): Existing database connection object. If provided, this connection
+            will be used instead of creating a new one.
+
+        Note:
+            Instead of providing `connection` or `connection_details`, database connection
+            information can be supplied via environment variables:
+            - DEEPFACE_POSTGRES_URI
+            - DEEPFACE_MONGO_URI
+            - DEEPFACE_WEAVIATE_URI
+            - DEEPFACE_NEO4J_URI
+            - DEEPFACE_PINECONE_API_KEY
+            - DEEPFACE_MILVUS_URI
+            - DEEPFACE_QDRANT_URI
+    Returns:
+        result (dict): A dictionary containing verification results.
+
+        - 'verified' (bool): Indicates whether the given image and the identity in the database
+            represent the same person (True) or different persons (False).
+
+        - 'distance' (float): The distance measure between the face vectors.
+            A lower distance indicates higher similarity.
+
+        - 'threshold' (float): The maximum threshold used for verification.
+            If the distance is below this threshold, the images are considered a match.
+
+        - 'confidence' (float): Confidence score indicating the likelihood that the images
+            represent the same person. The score is between 0 and 100, where higher values
+            indicate greater confidence in the verification result.
+
+        - 'model' (str): The chosen face recognition model.
+
+        - 'detector_backend' (str): The chosen face detector backend.
+
+        - 'similarity_metric' (str): The chosen similarity metric for measuring distances.
+
+        - 'id': ID of the identity in the database.
+
+        - 'img_name' (str): Name of the image file of the identity in the database.
+
+        - 'facial_areas' (dict): Rectangular regions of interest for faces.
+            - 'img1': region of interest for the given image.
+            - 'img2': None, because facial area of the identity is not stored in database.
+
+        - 'time' (float): Time taken for the identification process in seconds.
+    """
+    return datastore.identify(
+        img=img,
+        identity_id=identity_id,
+        model_name=model_name,
+        detector_backend=detector_backend,
+        distance_metric=distance_metric,
+        enforce_detection=enforce_detection,
+        align=align,
+        l2_normalize=l2_normalize,
+        expand_percentage=expand_percentage,
+        normalization=normalization,
+        anti_spoofing=anti_spoofing,
+        database_type=database_type,
+        connection_details=connection_details,
+        connection=connection,
+    )
+
+
 def build_index(
     model_name: str = "VGG-Face",
     detector_backend: str = "opencv",
@@ -919,7 +1069,8 @@ def build_index(
     - Use this function after registering all identities to the database.
     - This function is resumable, run again whenever new identities are added to the db.
     - Vector databases handle indexing internally, so you don't need to use this function
-        when using a vector database ('weaviate', 'neo4j', 'pgvector', 'pinecone')
+        when using a vector database
+        ('weaviate', 'neo4j', 'pgvector', 'pinecone', 'milvus', 'qdrant')
         as database_type.
 
     Args:
@@ -934,7 +1085,7 @@ def build_index(
         max_neighbors_per_node (int): Maximum number of neighbors per node in the index
             (default is 32).
         database_type (str): Type of database to build index. Options: 'postgres', 'mongo',
-            'weaviate', 'neo4j', 'pgvector', 'pinecone' (default is 'postgres').
+            'weaviate', 'neo4j', 'pgvector', 'pinecone', 'milvus', 'qdrant' (default is 'postgres').
         connection (Any): Existing database connection object. If provided, this connection
             will be used instead of creating a new one.
         connection_details (dict or str): Connection details for the database.
@@ -947,6 +1098,8 @@ def build_index(
             - DEEPFACE_WEAVIATE_URI
             - DEEPFACE_NEO4J_URI
             - DEEPFACE_PINECONE_API_KEY
+            - DEEPFACE_MILVUS_URI
+            - DEEPFACE_QDRANT_URI
     """
     return datastore.build_index(
         model_name=model_name,

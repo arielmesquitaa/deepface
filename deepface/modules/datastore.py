@@ -1,10 +1,11 @@
 # built-in dependencies
 import os
-from typing import Any, Dict, IO, List, Union, Optional, cast
+from typing import Any, Dict, IO, List, Tuple, Union, Optional, cast
 import uuid
 import time
 import math
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 
 # 3rd party dependencies
 import pandas as pd
@@ -16,10 +17,13 @@ from deepface.modules.database.types import Database
 from deepface.modules.database.inventory import database_inventory
 
 from deepface.modules.representation import represent
+from deepface.modules.demography import analyze
+from deepface.commons import image_utils
 from deepface.modules.verification import (
     find_angular_distance,
     find_cosine_distance,
     find_euclidean_distance,
+    find_distance,
     l2_normalize as find_l2_normalize,
     find_threshold,
     find_confidence,
@@ -28,6 +32,13 @@ from deepface.commons.logger import Logger
 
 
 logger = Logger()
+
+# facial attributes predicted and stored while registering to graph databases
+FACIAL_ATTRIBUTES = ["age", "gender", "emotion", "race"]
+
+# links verified identities in the background, so that search does not wait for it.
+# single worker serializes writes to avoid lock contention on the same relationships.
+_LINK_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="deepface-link")
 
 
 # pylint: disable=too-many-positional-arguments, no-else-return
@@ -70,7 +81,7 @@ def register(
             Options: base, raw, Facenet, Facenet2018, VGGFace, VGGFace2, ArcFace (default is base).
         anti_spoofing (boolean): Flag to enable anti spoofing (default is False).
         database_type (str): Type of database to register identities. Options: 'postgres', 'mongo',
-            'weaviate', 'neo4j', 'pgvector', 'pinecone' (default is 'postgres').
+            'weaviate', 'neo4j', 'pgvector', 'pinecone', 'milvus', 'qdrant' (default is 'postgres').
         connection_details (dict or str): Connection details for the database.
         connection (Any): Existing database connection object. If provided, this connection
             will be used instead of creating a new one.
@@ -83,6 +94,12 @@ def register(
             - DEEPFACE_WEAVIATE_URI
             - DEEPFACE_NEO4J_URI
             - DEEPFACE_PINECONE_API_KEY
+            - DEEPFACE_MILVUS_URI
+            - DEEPFACE_QDRANT_URI
+
+        Note:
+            For graph databases (neo4j), age, gender, emotion and race of each face are
+            also predicted and stored as properties of the face.
     Returns:
         result (dict): A dictionary containing registration results with following keys.
             - inserted (int): Number of embeddings successfully registered to the database.
@@ -93,8 +110,21 @@ def register(
         connection=connection,
     )
 
+    # graph databases store facial attributes as properties of face nodes
+    attributes: List[str] = (
+        FACIAL_ATTRIBUTES if database_inventory[database_type]["is_graph_db"] is True else []
+    )
+
+    sources = __split_images(img)
+
+    # load images once, file objects may not be readable twice by recognition and analysis
+    model_input: Any = img
+    if attributes:
+        sources_loaded = [image_utils.load_image(source)[0] for source in sources]
+        model_input = sources_loaded if len(sources) > 1 else sources_loaded[0]
+
     results = __get_embeddings(
-        img=img,
+        img=model_input,
         model_name=model_name,
         detector_backend=detector_backend,
         enforce_detection=enforce_detection,
@@ -106,17 +136,35 @@ def register(
         return_face=True,
     )
 
+    if attributes:
+        __assign_attributes(
+            results=results,
+            images=sources_loaded,
+            attributes=attributes,
+            detector_backend=detector_backend,
+            enforce_detection=enforce_detection,
+            align=align,
+            expand_percentage=expand_percentage,
+            anti_spoofing=anti_spoofing,
+        )
+
+    # faces detected in the same image share the same identifier
+    img_identifiers: Dict[int, str] = {}
     embedding_records: List[Dict[str, Any]] = []
     for result in results:
-        img_identifier = img_name or (
-            img
-            if isinstance(img, str) and img.endswith((".jpg", ".jpeg", ".png"))
-            else str(uuid.uuid4())
-        )
+        img_index = result["img_index"]
+        if img_index not in img_identifiers:
+            source = sources[img_index]
+            img_identifiers[img_index] = img_name or (
+                source
+                if isinstance(source, str) and source.endswith((".jpg", ".jpeg", ".png"))
+                else str(uuid.uuid4())
+            )
 
         embedding_record = {
             "id": None,
-            "img_name": img_identifier,
+            "img_name": img_identifiers[img_index],
+            "img_index": img_index,
             "face": result["face"],
             "model_name": model_name,
             "detector_backend": detector_backend,
@@ -124,6 +172,9 @@ def register(
             "aligned": align,
             "l2_normalized": l2_normalize,
         }
+        for attribute in FACIAL_ATTRIBUTES:
+            if attribute in result:
+                embedding_record[attribute] = result[attribute]
         embedding_records.append(embedding_record)
 
     inserted = db_client.insert_embeddings(embedding_records, batch_size=100)
@@ -186,7 +237,7 @@ def search(
         search_method (str): Method to use for searching identities. Options: 'exact', 'ann'.
             To use ann search, you must run build_index function first to create the index.
         database_type (str): Type of database to search identities. Options: 'postgres', 'mongo',
-            'weaviate', 'neo4j', 'pgvector', 'pinecone' (default is 'postgres').
+            'weaviate', 'neo4j', 'pgvector', 'pinecone', 'milvus', 'qdrant' (default is 'postgres').
         connection_details (dict or str): Connection details for the database.
         connection (Any): Existing database connection object. If provided, this connection
             will be used instead of creating a new one.
@@ -199,6 +250,8 @@ def search(
             - DEEPFACE_WEAVIATE_URI
             - DEEPFACE_NEO4J_URI
             - DEEPFACE_PINECONE_API_KEY
+            - DEEPFACE_MILVUS_URI
+            - DEEPFACE_QDRANT_URI
     Returns:
         results (List[pd.DataFrame]):
             A list of pandas dataframes or a list of dicts. Each dataframe or dict corresponds
@@ -318,7 +371,7 @@ def search(
                     ),
                 }
 
-                if similarity_search is False and verified:
+                if similarity_search is True or verified:
                     instances.append(instance)
 
             if len(instances) == 0:
@@ -382,7 +435,7 @@ def search(
                     ),
                 }
 
-                if similarity_search is False and verified:
+                if similarity_search is True or verified:
                     instances.append(instance)
 
             if len(instances) > 0:
@@ -392,6 +445,15 @@ def search(
                     df = df.nsmallest(k, "distance")
                 dfs.append(df)
 
+        __link_verified_identities(
+            db_client=db_client,
+            database_type=database_type,
+            dfs=dfs,
+            model_name=model_name,
+            detector_backend=detector_backend,
+            align=align,
+            l2_normalize=l2_normalize,
+        )
         return dfs
 
     elif search_method == "exact":
@@ -469,10 +531,232 @@ def search(
 
             dfs.append(df)
 
+        __link_verified_identities(
+            db_client=db_client,
+            database_type=database_type,
+            dfs=dfs,
+            model_name=model_name,
+            detector_backend=detector_backend,
+            align=align,
+            l2_normalize=l2_normalize,
+        )
         return dfs
 
     else:
         raise ValueError(f"Unsupported search method: {search_method}")
+
+
+def identify(
+    img: Union[str, NDArray[Any], IO[bytes]],
+    identity_id: Union[str, int],
+    model_name: str = "VGG-Face",
+    detector_backend: str = "opencv",
+    distance_metric: str = "cosine",
+    enforce_detection: bool = True,
+    align: bool = True,
+    l2_normalize: bool = False,
+    expand_percentage: int = 0,
+    normalization: str = "base",
+    anti_spoofing: bool = False,
+    database_type: str = "postgres",
+    connection_details: Optional[Union[Dict[str, Any], str]] = None,
+    connection: Any = None,
+) -> Dict[str, Any]:
+    """
+    Verify given image against a single identity stored in the database. Unlike search
+        function, this does not scan the whole database. It pulls the embedding of the
+        given id only, so it runs in O(1) instead of O(n).
+    Args:
+        img (str or np.ndarray or IO[bytes]): The exact path to the image, a numpy array
+            in BGR format, a file object that supports at least `.read` and is opened in binary
+            mode, or a base64 encoded image. This must be a single image, batch of images is
+            not allowed. That single image may still have many faces.
+        identity_id (str or int): ID of the embedding record in the database to compare
+            the given image against.
+        model_name (str): Model for face recognition. Options: VGG-Face, Facenet, Facenet512,
+            OpenFace, DeepFace, DeepID, Dlib, ArcFace, SFace and GhostFaceNet (default is VGG-Face).
+        detector_backend (string): face detector backend. Options: 'opencv', 'retinaface',
+            'mtcnn', 'ssd', 'dlib', 'mediapipe', 'yolov8n', 'yolov8m', 'yolov8l', 'yolov11n',
+            'yolov11s', 'yolov11m', 'yolov11l', 'yolov12n', 'yolov12s', 'yolov12m', 'yolov12l',
+            'centerface' or 'skip' (default is opencv).
+        distance_metric (string): Metric for measuring similarity. Options: 'cosine',
+            'euclidean', 'euclidean_l2', 'angular' (default is cosine).
+        enforce_detection (boolean): If no face is detected in an image, raise an exception.
+            Set to False to avoid the exception for low-resolution images (default is True).
+        align (bool): Flag to enable face alignment (default is True).
+        l2_normalize (bool): Flag to enable L2 normalization (unit vector normalization)
+        expand_percentage (int): expand detected facial area with a percentage (default is 0).
+        normalization (string): Normalize the input image before feeding it to the model.
+            Options: base, raw, Facenet, Facenet2018, VGGFace, VGGFace2, ArcFace (default is base).
+        anti_spoofing (boolean): Flag to enable anti spoofing (default is False).
+        database_type (str): Type of database storing the identities. Options: 'postgres',
+            'mongo', 'weaviate', 'neo4j', 'pgvector', 'pinecone', 'milvus', 'qdrant'
+            (default is 'postgres').
+        connection_details (dict or str): Connection details for the database.
+        connection (Any): Existing database connection object. If provided, this connection
+            will be used instead of creating a new one.
+
+        Note:
+            Instead of providing `connection` or `connection_details`, database connection
+            information can be supplied via environment variables:
+            - DEEPFACE_POSTGRES_URI
+            - DEEPFACE_MONGO_URI
+            - DEEPFACE_WEAVIATE_URI
+            - DEEPFACE_NEO4J_URI
+            - DEEPFACE_PINECONE_API_KEY
+            - DEEPFACE_MILVUS_URI
+            - DEEPFACE_QDRANT_URI
+    Returns:
+        result (dict): A dictionary containing verification results with following keys.
+            - 'verified' (bool): Indicates whether the given image and the identity in the
+                database represent the same person (True) or different persons (False).
+            - 'distance' (float): The distance measure between the face vectors. A lower
+                distance indicates higher similarity.
+            - 'threshold' (float): The maximum threshold used for verification. If the distance
+                is below this threshold, the images are considered a match.
+            - 'confidence' (float): Confidence score indicating the likelihood that the images
+                represent the same person. The score is between 0 and 100, where higher values
+                indicate greater confidence in the verification result.
+            - 'model' (str): The chosen face recognition model.
+            - 'detector_backend' (str): The chosen face detector backend.
+            - 'similarity_metric' (str): The chosen similarity metric for measuring distances.
+            - 'id': ID of the identity in the database.
+            - 'img_name' (str): Name of the image file of the identity in the database.
+            - 'facial_areas' (dict): Rectangular regions of interest for faces.
+                - 'img1': region of interest for the given image.
+                - 'img2': None, because facial area of the identity is not stored in database.
+            - 'time' (float): Time taken for the identification process in seconds.
+    """
+    tic = time.time()
+
+    # a single image is expected, while that image may still have many faces
+    num_of_images = (
+        len(img)
+        if isinstance(img, list)
+        else img.shape[0] if isinstance(img, np.ndarray) and img.ndim == 4 else 1
+    )
+    if num_of_images > 1:
+        raise ValueError(
+            f"identify function expects a single image, but {num_of_images} images are given."
+            " Please call it once for each image."
+        )
+
+    threshold = find_threshold(model_name=model_name, distance_metric=distance_metric)
+
+    db_client = __connect_database(
+        database_type=database_type,
+        connection_details=connection_details,
+        connection=connection,
+    )
+
+    try:
+        # criteria are required by databases storing each criteria set in its own
+        # table, collection, index or node label
+        source_embedding_record = db_client.fetch_embedding(
+            identity_id=identity_id,
+            model_name=model_name,
+            detector_backend=detector_backend,
+            aligned=align,
+            l2_normalized=l2_normalize,
+        )
+    finally:
+        # Close the database connection if it was created internally
+        if connection is None:
+            db_client.close()
+
+    if source_embedding_record is None:
+        raise ValueError(f"No embedding found in the database for {identity_id=}.")
+
+    # criteria are available only if the database stores them along with the embedding
+    registered_model_name = source_embedding_record.get("model_name")
+    registered_detector_backend = source_embedding_record.get("detector_backend")
+    registered_aligned = source_embedding_record.get("aligned")
+    registered_l2_normalized = source_embedding_record.get("l2_normalized")
+
+    # distances of embeddings coming from different models or normalizations are not comparable
+    if registered_model_name is not None and registered_model_name != model_name:
+        raise ValueError(
+            f"Embedding of {identity_id=} was registered with"
+            f" {registered_model_name} model while {model_name} is requested."
+        )
+
+    if registered_l2_normalized is not None and bool(registered_l2_normalized) != l2_normalize:
+        raise ValueError(
+            f"Embedding of {identity_id=} was registered with"
+            f" l2_normalize={registered_l2_normalized} while {l2_normalize} is requested."
+        )
+
+    if (
+        registered_detector_backend is not None
+        and registered_detector_backend != detector_backend
+    ) or (registered_aligned is not None and bool(registered_aligned) != align):
+        logger.warn(
+            f"Embedding of {identity_id=} was registered with"
+            f" detector_backend={registered_detector_backend} and"
+            f" align={registered_aligned} while {detector_backend} and"
+            f" {align} are requested. This may affect the distance calculation."
+        )
+
+    results = __get_embeddings(
+        img=img,
+        model_name=model_name,
+        detector_backend=detector_backend,
+        enforce_detection=enforce_detection,
+        align=align,
+        anti_spoofing=anti_spoofing,
+        expand_percentage=expand_percentage,
+        normalization=normalization,
+        l2_normalize=l2_normalize,
+        return_face=False,
+    )
+
+    # if given image has many faces, then find the closest one to the identity
+    min_distance, min_idx = float("inf"), None
+    for idx, result in enumerate(results):
+        distance = float(
+            cast(
+                np.float64,
+                find_distance(
+                    source_embedding_record["embedding"],
+                    result["embedding"],
+                    distance_metric,
+                ),
+            )
+        )
+        if distance < min_distance:
+            min_distance, min_idx = distance, idx
+
+    verified = bool(min_distance <= threshold)
+    facial_area = None if min_idx is None else results[min_idx].get("facial_area", None)
+
+    # database drivers may return numpy scalars, while payload must have core python types
+    identity = source_embedding_record["id"]
+    if isinstance(identity, np.generic):
+        identity = identity.item()
+
+    toc = time.time()
+
+    return {
+        "verified": verified,
+        "distance": float(min_distance),
+        "threshold": float(threshold),
+        "confidence": float(
+            find_confidence(
+                distance=min_distance,
+                model_name=model_name,
+                distance_metric=distance_metric,
+                verified=verified,
+            )
+        ),
+        "model": model_name,
+        "detector_backend": detector_backend,
+        "similarity_metric": distance_metric,
+        "id": identity,
+        "img_name": str(source_embedding_record["img_name"]),
+        # facial area of the identity is not stored in the database
+        "facial_areas": {"img1": facial_area, "img2": None},
+        "time": round(toc - tic, 2),
+    }
 
 
 def build_index(
@@ -501,7 +785,7 @@ def build_index(
         max_neighbors_per_node (int): Maximum number of neighbors per node in the index
             (default is 32).
         database_type (str): Type of database to build index. Options: 'postgres', 'mongo',
-            'weaviate', 'neo4j', 'pgvector', 'pinecone' (default is 'postgres').
+            'weaviate', 'neo4j', 'pgvector', 'pinecone', 'milvus', 'qdrant' (default is 'postgres').
         connection (Any): Existing database connection object. If provided, this connection
             will be used instead of creating a new one.
         connection_details (dict or str): Connection details for the database.
@@ -514,6 +798,8 @@ def build_index(
             - DEEPFACE_WEAVIATE_URI
             - DEEPFACE_NEO4J_URI
             - DEEPFACE_PINECONE_API_KEY
+            - DEEPFACE_MILVUS_URI
+            - DEEPFACE_QDRANT_URI
     """
 
     if database_inventory.get(database_type) is None:
@@ -680,13 +966,151 @@ def __get_embeddings(
     if len(results) == 0:
         raise ValueError("No embeddings were detected in the provided image(s).")
 
+    # img_index keeps track of which input image each face was detected in
     flat_results: List[Dict[str, Any]] = []
-    for result in results:
+    for idx, result in enumerate(results):
         if isinstance(result, dict):
-            flat_results.append(result)
+            flat_results.append({**result, "img_index": 0})
         elif isinstance(result, list):
-            flat_results.extend(result)
+            flat_results.extend({**face, "img_index": idx} for face in result)
     return flat_results
+
+
+def __split_images(
+    img: Union[str, NDArray[Any], IO[bytes], List[str], List[NDArray[Any]], List[IO[bytes]]],
+) -> List[Any]:
+    """
+    Split the input of register into single images, in the same order that represent
+        processes them.
+    Args:
+        img (str or np.ndarray or IO[bytes] or list): single image or batch of images.
+    Returns:
+        images (list): list of single images.
+    """
+    if isinstance(img, list):
+        return img
+    if isinstance(img, np.ndarray) and img.ndim == 4:
+        return [img[i] for i in range(img.shape[0])]
+    return [img]
+
+
+def __assign_attributes(
+    results: List[Dict[str, Any]],
+    images: List[NDArray[Any]],
+    attributes: List[str],
+    detector_backend: str,
+    enforce_detection: bool,
+    align: bool,
+    expand_percentage: int,
+    anti_spoofing: bool,
+) -> None:
+    """
+    Predict facial attributes of each image and assign them to the faces found by represent
+        in place. Analysis detects faces on its own, so its faces are matched to the faces
+        of represent by their facial areas.
+    Args:
+        results (List[Dict[str, Any]]): flattened represent results having img_index.
+        images (List[np.ndarray]): loaded images, in the order of img_index.
+        attributes (List[str]): attributes to predict. Options: 'age', 'gender', 'emotion',
+            'race'.
+        detector_backend (string): face detector backend.
+        enforce_detection (boolean): If no face is detected in an image, raise an exception.
+        align (bool): Flag to enable face alignment.
+        expand_percentage (int): expand detected facial area with a percentage.
+        anti_spoofing (boolean): Flag to enable anti spoofing.
+    """
+
+    def area_key(area: Dict[str, Any]) -> Tuple[Any, ...]:
+        return (area.get("x"), area.get("y"), area.get("w"), area.get("h"))
+
+    for img_index, image in enumerate(images):
+        faces = [result for result in results if result["img_index"] == img_index]
+        if not faces:
+            continue
+
+        analyses = cast(
+            List[Dict[str, Any]],
+            analyze(
+                img_path=image,
+                actions=attributes,
+                enforce_detection=enforce_detection,
+                detector_backend=detector_backend,
+                align=align,
+                expand_percentage=expand_percentage,
+                silent=True,
+                anti_spoofing=anti_spoofing,
+            ),
+        )
+        analyses_by_area = {area_key(analysis["region"]): analysis for analysis in analyses}
+
+        for face in faces:
+            analysis = analyses_by_area.get(area_key(face["facial_area"]))
+            # skip detector reports the whole image with different dummy areas
+            if analysis is None and len(faces) == 1 and len(analyses) == 1:
+                analysis = analyses[0]
+            if analysis is None:
+                logger.warn(
+                    f"Could not match facial attributes to the face at {face['facial_area']}"
+                    f" in image {img_index}, storing it without attributes."
+                )
+                continue
+
+            if "age" in attributes:
+                face["age"] = int(analysis["age"])
+            # store dominant label of categorical attributes
+            for attribute in ("gender", "emotion", "race"):
+                if attribute in attributes:
+                    face[attribute] = analysis[f"dominant_{attribute}"]
+
+
+def __link_verified_identities(
+    db_client: Database,
+    database_type: str,
+    dfs: List[pd.DataFrame],
+    model_name: str,
+    detector_backend: str,
+    align: bool,
+    l2_normalize: bool,
+) -> None:
+    """
+    Store relationships between identities verified as the same person in a search,
+        if the database is a graph database. Only rows within the threshold are linked,
+        so similarity search results are not considered as the same person. Linking runs
+        in the background, so search returns without waiting for it.
+    Args:
+        db_client (Database): An instance of the connected database client.
+        database_type (str): Type of the database.
+        dfs (List[pd.DataFrame]): Search results, one dataframe per detected face.
+        model_name (str): Model for face recognition.
+        detector_backend (string): face detector backend.
+        align (bool): Flag to enable face alignment.
+        l2_normalize (bool): Flag to enable L2 normalization (unit vector normalization)
+    """
+    if database_inventory[database_type]["is_graph_db"] is False:
+        return
+
+    clusters = [
+        df[df["distance"] <= df["threshold"]]["id"].tolist() for df in dfs if not df.empty
+    ]
+
+    if not any(len(cluster) > 1 for cluster in clusters):
+        return
+
+    def link() -> None:
+        # search results are already returned, so only log if linking fails
+        try:
+            linked = db_client.link_verified_identities(
+                clusters=clusters,
+                model_name=model_name,
+                detector_backend=detector_backend,
+                aligned=align,
+                l2_normalized=l2_normalize,
+            )
+            logger.debug(f"Linked {linked} verified identity pairs in {database_type}.")
+        except Exception as err:  # pylint: disable=broad-except
+            logger.warn(f"Could not link verified identities in {database_type}: {err}")
+
+    _LINK_EXECUTOR.submit(link)
 
 
 def __connect_database(
@@ -698,7 +1122,7 @@ def __connect_database(
     Connect to the specified database type
     Args:
         database_type (str): Type of database to connect. Options: 'postgres', 'mongo',
-            'weaviate', 'neo4j', 'pgvector', 'pinecone' (default is 'postgres').
+            'weaviate', 'neo4j', 'pgvector', 'pinecone', 'milvus', 'qdrant' (default is 'postgres').
         connection_details (dict or str): Connection details for the database.
         connection (Any): Existing database connection object. If provided, this connection
             will be used instead of creating a new one.
@@ -711,6 +1135,8 @@ def __connect_database(
             - DEEPFACE_WEAVIATE_URI
             - DEEPFACE_NEO4J_URI
             - DEEPFACE_PINECONE_API_KEY
+            - DEEPFACE_MILVUS_URI
+            - DEEPFACE_QDRANT_URI
     Returns:
         db_client (Database): An instance of the connected database client.
     """
